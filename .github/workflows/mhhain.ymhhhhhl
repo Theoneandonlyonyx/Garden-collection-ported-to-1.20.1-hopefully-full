@@ -1,0 +1,93 @@
+name: build-jarfixxed
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  MC_FORGE: 1.20.1-47.3.0
+  MDK_URL: https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.3.0/forge-1.20.1-47.3.0-mdk.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick the newest zip and unpack it
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No zip in the repo root, building the repo root itself"
+            echo "SRC=." >> "$GITHUB_ENV"
+          else
+            newest=""; best=-1
+            for z in "${zips[@]}"; do
+              t=$(git log -1 --format=%ct -- "$z"); t=${t:-0}
+              if [ "$t" -gt "$best" ] || { [ "$t" -eq "$best" ] && [[ "$z" > "$newest" ]]; }; then
+                best=$t; newest=$z
+              fi
+            done
+            echo "Using zip: $newest"
+            rm -rf _src && mkdir _src
+            unzip -q -o "$newest" -d _src
+            # project root = folder containing build.gradle, else the one containing src/main
+            root=$(find _src -name build.gradle -printf '%h\n' | head -1)
+            [ -z "$root" ] && root=$(find _src -type d -path '*/src/main' -printf '%h\n' | head -1 | xargs -r dirname)
+            [ -z "$root" ] && root=_src
+            echo "SRC=$root" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check for needed files, download whatever is missing
+        working-directory: ${{ env.SRC }}
+        run: |
+          need=(build.gradle settings.gradle gradle.properties gradlew
+                gradle/wrapper/gradle-wrapper.jar gradle/wrapper/gradle-wrapper.properties
+                src/main/resources/META-INF/mods.toml src/main/resources/pack.mcmeta)
+          missing=()
+          for f in "${need[@]}"; do
+            if [ -e "$f" ]; then echo "found    $f"; else echo "MISSING  $f"; missing+=("$f"); fi
+          done
+
+          # the mod itself can't be downloaded
+          if ! find src/main/java -name '*.java' 2>/dev/null | grep -q .; then
+            echo "::error::No Java sources in src/main/java - nothing to build"; exit 1
+          fi
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Downloading Forge MDK to fill the gaps..."
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/mdk.zip" "$MDK_URL"
+            rm -rf "$RUNNER_TEMP/mdk" && mkdir "$RUNNER_TEMP/mdk"
+            unzip -q "$RUNNER_TEMP/mdk.zip" -d "$RUNNER_TEMP/mdk"
+            mdk=$(dirname "$(find "$RUNNER_TEMP/mdk" -name build.gradle | head -1)")
+            for f in "${missing[@]}"; do
+              if [ -e "$mdk/$f" ]; then
+                mkdir -p "$(dirname "$f")"
+                cp -n "$mdk/$f" "$f"          # never overwrites existing files
+                echo "filled   $f"
+              else
+                echo "::warning::$f is not in the MDK either"
+              fi
+            done
+            chmod +x gradlew 2>/dev/null || true
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.1.1
+
+      - run: gradle build --no-daemon
+        working-directory: ${{ env.SRC }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlantMegaPack-mikexxx-port-jar
+          path: ${{ env.SRC }}/build/libs/*.jar
+          if-no-files-found: error
